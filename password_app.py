@@ -4,7 +4,7 @@ import json
 import time
 import sqlite3
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, ttk, filedialog, simpledialog
 
 import pyotp
 import qrcode
@@ -17,12 +17,15 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 DB_FILE = "authenticator.db"
+
 LOCK_TIMEOUT_MS = 5 * 60 * 1000
+CLIPBOARD_CLEAR_MS = 30 * 1000
+
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_LOCKOUT_SECONDS = 10 * 60
 
 ph = PasswordHasher()
 
-
-# ---------- DATABASE ----------
 
 def db_connect():
     return sqlite3.connect(DB_FILE)
@@ -63,17 +66,24 @@ def meta_get(key):
 def meta_set(key, value):
     conn = db_connect()
     cur = conn.cursor()
-
     cur.execute("""
         INSERT OR REPLACE INTO vault_meta (key, value)
         VALUES (?, ?)
     """, (key, value))
-
     conn.commit()
     conn.close()
 
 
-# ---------- CRYPTO ----------
+def meta_get_text(key, default=""):
+    value = meta_get(key)
+    if value is None:
+        return default
+    return value.decode()
+
+
+def meta_set_text(key, value):
+    meta_set(key, str(value).encode())
+
 
 def derive_key(master_password, salt):
     return hash_secret_raw(
@@ -109,8 +119,6 @@ def decrypt_record(dek, nonce, ciphertext):
     return json.loads(plaintext.decode())
 
 
-# ---------- PASSWORD POLICY ----------
-
 def validate_master_password(password):
     if len(password) < 12:
         return False, "Master password must be at least 12 characters long."
@@ -130,7 +138,42 @@ def validate_master_password(password):
     return True, ""
 
 
-# ---------- VAULT ----------
+def get_lockout_until():
+    try:
+        return int(meta_get_text("lockout_until", "0"))
+    except ValueError:
+        return 0
+
+
+def get_failed_attempts():
+    try:
+        return int(meta_get_text("failed_attempts", "0"))
+    except ValueError:
+        return 0
+
+
+def is_login_locked():
+    return int(time.time()) < get_lockout_until()
+
+
+def login_lock_remaining():
+    return max(0, get_lockout_until() - int(time.time()))
+
+
+def record_failed_login():
+    attempts = get_failed_attempts() + 1
+
+    if attempts >= MAX_LOGIN_ATTEMPTS:
+        meta_set_text("failed_attempts", 0)
+        meta_set_text("lockout_until", int(time.time()) + LOGIN_LOCKOUT_SECONDS)
+    else:
+        meta_set_text("failed_attempts", attempts)
+
+
+def reset_failed_logins():
+    meta_set_text("failed_attempts", 0)
+    meta_set_text("lockout_until", 0)
+
 
 def vault_exists():
     return meta_get("master_hash") is not None
@@ -149,11 +192,7 @@ def create_vault(master_password, twofa_secret):
     dek = os.urandom(32)
 
     dek_nonce, encrypted_dek = encrypt_bytes(kek, dek)
-
-    twofa_nonce, encrypted_twofa_secret = encrypt_bytes(
-        dek,
-        twofa_secret.encode()
-    )
+    twofa_nonce, encrypted_twofa_secret = encrypt_bytes(dek, twofa_secret.encode())
 
     meta_set("master_hash", master_hash.encode())
     meta_set("kdf_salt", kdf_salt)
@@ -162,8 +201,13 @@ def create_vault(master_password, twofa_secret):
     meta_set("twofa_nonce", twofa_nonce)
     meta_set("encrypted_twofa_secret", encrypted_twofa_secret)
 
+    reset_failed_logins()
+
 
 def unlock_vault(master_password, twofa_code):
+    if is_login_locked():
+        return None
+
     master_hash = meta_get("master_hash")
 
     if not master_hash:
@@ -206,8 +250,6 @@ def unlock_vault(master_password, twofa_code):
     return dek
 
 
-# ---------- VAULT ENTRIES ----------
-
 def add_vault_entry(service, username, password, secret, dek):
     data = {
         "service": service,
@@ -231,6 +273,29 @@ def add_vault_entry(service, username, password, secret, dek):
     conn.close()
 
 
+def update_vault_entry(entry_id, service, username, password, secret, dek):
+    data = {
+        "service": service,
+        "username": username,
+        "password": password,
+        "secret": secret
+    }
+
+    nonce, ciphertext = encrypt_record(dek, data)
+
+    conn = db_connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        UPDATE vault_entries
+        SET nonce = ?, ciphertext = ?
+        WHERE id = ?
+    """, (nonce, ciphertext, entry_id))
+
+    conn.commit()
+    conn.close()
+
+
 def get_vault_entries():
     conn = db_connect()
     cur = conn.cursor()
@@ -249,21 +314,121 @@ def get_vault_entries():
 def delete_vault_entry(entry_id):
     conn = db_connect()
     cur = conn.cursor()
-
     cur.execute("DELETE FROM vault_entries WHERE id = ?", (entry_id,))
-
     conn.commit()
     conn.close()
 
 
-# ---------- MAIN WINDOW ----------
+def derive_backup_key(backup_password, salt):
+    return hash_secret_raw(
+        secret=backup_password.encode(),
+        salt=salt,
+        time_cost=3,
+        memory_cost=65536,
+        parallelism=2,
+        hash_len=32,
+        type=Type.ID
+    )
+
+
+def export_encrypted_backup():
+    backup_password = simpledialog.askstring(
+        "Backup Password",
+        "Enter a password to encrypt the backup:",
+        show="*"
+    )
+
+    if not backup_password:
+        return
+
+    file_path = filedialog.asksaveasfilename(
+        title="Save Encrypted Backup",
+        defaultextension=".vaultbak",
+        filetypes=[("Vault Backup", "*.vaultbak")]
+    )
+
+    if not file_path:
+        return
+
+    with open(DB_FILE, "rb") as f:
+        db_bytes = f.read()
+
+    salt = os.urandom(16)
+    key = derive_backup_key(backup_password, salt)
+    nonce, ciphertext = encrypt_bytes(key, db_bytes)
+
+    backup_data = {
+        "version": 1,
+        "salt": salt.hex(),
+        "nonce": nonce.hex(),
+        "ciphertext": ciphertext.hex()
+    }
+
+    with open(file_path, "w") as f:
+        json.dump(backup_data, f)
+
+    messagebox.showinfo("Backup Saved", "Encrypted backup created successfully.")
+
+
+def import_encrypted_backup():
+    confirm = messagebox.askyesno(
+        "Restore Backup",
+        "Restoring a backup will replace the current vault database. Continue?"
+    )
+
+    if not confirm:
+        return
+
+    file_path = filedialog.askopenfilename(
+        title="Open Encrypted Backup",
+        filetypes=[("Vault Backup", "*.vaultbak")]
+    )
+
+    if not file_path:
+        return
+
+    backup_password = simpledialog.askstring(
+        "Backup Password",
+        "Enter the backup password:",
+        show="*"
+    )
+
+    if not backup_password:
+        return
+
+    try:
+        with open(file_path, "r") as f:
+            backup_data = json.load(f)
+
+        salt = bytes.fromhex(backup_data["salt"])
+        nonce = bytes.fromhex(backup_data["nonce"])
+        ciphertext = bytes.fromhex(backup_data["ciphertext"])
+
+        key = derive_backup_key(backup_password, salt)
+        db_bytes = decrypt_bytes(key, nonce, ciphertext)
+
+        with open(DB_FILE, "wb") as f:
+            f.write(db_bytes)
+
+        messagebox.showinfo(
+            "Backup Restored",
+            "Backup restored successfully. Restart the app before unlocking."
+        )
+
+    except Exception:
+        messagebox.showerror(
+            "Error",
+            "Could not restore backup. Wrong password or damaged backup file."
+        )
+
 
 def open_main_window(dek):
     main = tk.Tk()
     main.title("Secure Password and Authenticator Vault")
-    main.geometry("1100x550")
+    main.geometry("1050x630")
 
     lock_timer = None
+    clipboard_timer = None
     decrypted_cache = {}
 
     def lock_app():
@@ -278,6 +443,24 @@ def open_main_window(dek):
             main.after_cancel(lock_timer)
 
         lock_timer = main.after(LOCK_TIMEOUT_MS, lock_app)
+
+    def clear_clipboard():
+        main.clipboard_clear()
+        main.update()
+        status_label.config(text="Clipboard cleared.")
+
+    def copy_to_clipboard(value, message):
+        nonlocal clipboard_timer
+
+        main.clipboard_clear()
+        main.clipboard_append(value)
+        main.update()
+
+        if clipboard_timer:
+            main.after_cancel(clipboard_timer)
+
+        clipboard_timer = main.after(CLIPBOARD_CLEAR_MS, clear_clipboard)
+        status_label.config(text=message + " Clipboard will clear in 30 seconds.")
 
     main.bind_all("<Key>", reset_lock_timer)
     main.bind_all("<Button>", reset_lock_timer)
@@ -301,10 +484,10 @@ def open_main_window(dek):
     tree.heading("code", text="Authenticator Code")
     tree.heading("expires", text="Expires")
 
-    tree.column("service", width=200)
-    tree.column("username", width=250)
+    tree.column("service", width=220)
+    tree.column("username", width=270)
     tree.column("password", width=120, anchor="center")
-    tree.column("code", width=150, anchor="center")
+    tree.column("code", width=160, anchor="center")
     tree.column("expires", width=80, anchor="center")
 
     tree.pack(fill="both", expand=True, padx=10, pady=10)
@@ -338,15 +521,16 @@ def open_main_window(dek):
 
                 password_display = "Saved" if password else "None"
 
-                values = (
-                    service,
-                    username,
-                    password_display,
-                    code,
-                    f"{remaining}s"
-                )
-
-                entries.append((item_id, values))
+                entries.append((
+                    item_id,
+                    (
+                        service,
+                        username,
+                        password_display,
+                        code,
+                        f"{remaining}s"
+                    )
+                ))
 
             except Exception:
                 entries.append((
@@ -392,20 +576,13 @@ def open_main_window(dek):
             return
 
         data = decrypted_cache.get(item_id)
-        if not data:
-            messagebox.showerror("Error", "Username is not available.")
-            return
+        username = data.get("username", "") if data else ""
 
-        username = data.get("username", "")
         if not username:
             messagebox.showerror("Error", "No username saved for this entry.")
             return
 
-        main.clipboard_clear()
-        main.clipboard_append(username)
-        main.update()
-
-        status_label.config(text=f"Copied username: {username}")
+        copy_to_clipboard(username, f"Copied username: {username}")
 
     def copy_selected_password():
         item_id = get_selected_item()
@@ -413,20 +590,13 @@ def open_main_window(dek):
             return
 
         data = decrypted_cache.get(item_id)
-        if not data:
-            messagebox.showerror("Error", "Password is not available.")
-            return
+        password = data.get("password", "") if data else ""
 
-        password = data.get("password", "")
         if not password:
             messagebox.showerror("Error", "No password saved for this entry.")
             return
 
-        main.clipboard_clear()
-        main.clipboard_append(password)
-        main.update()
-
-        status_label.config(text="Copied password to clipboard.")
+        copy_to_clipboard(password, "Copied password.")
 
     def copy_selected_code():
         item_id = get_selected_item()
@@ -434,11 +604,8 @@ def open_main_window(dek):
             return
 
         data = decrypted_cache.get(item_id)
-        if not data:
-            messagebox.showerror("Error", "Authenticator code is not available.")
-            return
+        secret = data.get("secret", "") if data else ""
 
-        secret = data.get("secret", "")
         if not secret:
             messagebox.showerror("Error", "No authenticator secret saved for this entry.")
             return
@@ -449,17 +616,28 @@ def open_main_window(dek):
             messagebox.showerror("Error", "Invalid authenticator secret.")
             return
 
-        main.clipboard_clear()
-        main.clipboard_append(code)
-        main.update()
-
-        status_label.config(text=f"Copied code: {code}")
+        copy_to_clipboard(code, f"Copied code: {code}")
 
     tree.bind("<Double-1>", lambda event: copy_selected_code())
 
-    def add_entry_window():
+    def entry_window(mode="add"):
+        editing = mode == "edit"
+        item_id = None
+        existing = {}
+
+        if editing:
+            item_id = get_selected_item()
+            if not item_id:
+                return
+
+            existing = decrypted_cache.get(item_id)
+
+            if not existing:
+                messagebox.showerror("Error", "Could not decrypt selected entry.")
+                return
+
         win = tk.Toplevel(main)
-        win.title("Add Vault Entry")
+        win.title("Edit Vault Entry" if editing else "Add Vault Entry")
         win.geometry("420x400")
         win.resizable(False, False)
 
@@ -478,6 +656,12 @@ def open_main_window(dek):
         tk.Label(win, text="Authenticator Secret Key").pack(pady=5)
         secret_entry = tk.Entry(win, show="*", width=42)
         secret_entry.pack()
+
+        if editing:
+            service_entry.insert(0, existing.get("service", ""))
+            username_entry.insert(0, existing.get("username", ""))
+            password_entry.insert(0, existing.get("password", ""))
+            secret_entry.insert(0, existing.get("secret", ""))
 
         def save():
             service = service_entry.get().strip()
@@ -507,13 +691,22 @@ def open_main_window(dek):
                     messagebox.showerror("Error", "Invalid authenticator secret.")
                     return
 
-            add_vault_entry(service, username, password, secret, dek)
+            if editing:
+                update_vault_entry(item_id, service, username, password, secret, dek)
+                status_label.config(text="Entry updated and re-encrypted.")
+            else:
+                add_vault_entry(service, username, password, secret, dek)
+                status_label.config(text="Entry encrypted and saved.")
 
-            messagebox.showinfo("Saved", "Entry encrypted and saved.")
             win.destroy()
             refresh_codes()
 
-        tk.Button(win, text="Save", width=15, command=save).pack(pady=20)
+        tk.Button(
+            win,
+            text="Save Changes" if editing else "Save",
+            width=15,
+            command=save
+        ).pack(pady=20)
 
     def delete_selected():
         item_id = get_selected_item()
@@ -536,19 +729,75 @@ def open_main_window(dek):
     button_frame = tk.Frame(main)
     button_frame.pack(pady=10)
 
-    tk.Button(button_frame, text="Add", width=15, command=add_entry_window).grid(row=0, column=0, padx=5)
-    tk.Button(button_frame, text="Copy Username", width=15, command=copy_selected_username).grid(row=0, column=1, padx=5)
-    tk.Button(button_frame, text="Copy Password", width=15, command=copy_selected_password).grid(row=0, column=2, padx=5)
-    tk.Button(button_frame, text="Copy Code", width=15, command=copy_selected_code).grid(row=0, column=3, padx=5)
-    tk.Button(button_frame, text="Delete", width=15, command=delete_selected).grid(row=0, column=4, padx=5)
-    tk.Button(button_frame, text="Lock Vault", width=15, command=main.destroy).grid(row=0, column=5, padx=5)
+    # Row 1: copy and lock buttons
+    tk.Button(
+        button_frame,
+        text="Copy Username",
+        width=16,
+        command=copy_selected_username
+    ).grid(row=0, column=0, padx=5, pady=5)
+
+    tk.Button(
+        button_frame,
+        text="Copy Password",
+        width=16,
+        command=copy_selected_password
+    ).grid(row=0, column=1, padx=5, pady=5)
+
+    tk.Button(
+        button_frame,
+        text="Copy Code",
+        width=16,
+        command=copy_selected_code
+    ).grid(row=0, column=2, padx=5, pady=5)
+
+    tk.Button(
+        button_frame,
+        text="Lock Vault",
+        width=16,
+        command=main.destroy
+    ).grid(row=0, column=3, padx=5, pady=5)
+
+    # Row 2: management and backup buttons
+    tk.Button(
+        button_frame,
+        text="Add",
+        width=16,
+        command=lambda: entry_window("add")
+    ).grid(row=1, column=0, padx=5, pady=5)
+
+    tk.Button(
+        button_frame,
+        text="Edit",
+        width=16,
+        command=lambda: entry_window("edit")
+    ).grid(row=1, column=1, padx=5, pady=5)
+
+    tk.Button(
+        button_frame,
+        text="Delete",
+        width=16,
+        command=delete_selected
+    ).grid(row=1, column=2, padx=5, pady=5)
+
+    tk.Button(
+        button_frame,
+        text="Backup Vault",
+        width=16,
+        command=export_encrypted_backup
+    ).grid(row=1, column=3, padx=5, pady=5)
+
+    tk.Button(
+        button_frame,
+        text="Restore Vault",
+        width=16,
+        command=import_encrypted_backup
+    ).grid(row=1, column=4, padx=5, pady=5)
 
     refresh_codes()
     reset_lock_timer()
     main.mainloop()
 
-
-# ---------- LOGIN / CREATE VAULT WINDOW ----------
 
 def start_login_window():
     root = tk.Tk()
@@ -597,8 +846,7 @@ def start_login_window():
             root,
             text=(
                 "Required 2FA Setup:\n"
-                "Scan this QR code with Google Authenticator,\n"
-                "Microsoft Authenticator, Authy, or another TOTP app."
+                "Scan this QR code with your authenticator app."
             ),
             justify="center"
         ).pack(pady=10)
@@ -649,9 +897,12 @@ def start_login_window():
         tk.Button(root, text="Create Vault", command=create).pack(pady=20)
 
     else:
-        root.geometry("350x320")
+        root.geometry("370x390")
 
         tk.Label(root, text="Enter Master Password", font=("Arial", 14)).pack(pady=20)
+
+        lockout_status = tk.Label(root, text="", fg="red")
+        lockout_status.pack(pady=5)
 
         tk.Label(root, text="Password").pack()
         password_entry = tk.Entry(root, show="*", width=35)
@@ -661,25 +912,61 @@ def start_login_window():
         twofa_entry = tk.Entry(root, width=20)
         twofa_entry.pack(pady=5)
 
+        def update_lockout_label():
+            if is_login_locked():
+                seconds = login_lock_remaining()
+                minutes = seconds // 60
+                remainder = seconds % 60
+                lockout_status.config(
+                    text=f"Locked. Try again in {minutes}:{remainder:02d}"
+                )
+            else:
+                attempts = get_failed_attempts()
+                if attempts:
+                    lockout_status.config(
+                        text=f"Failed attempts: {attempts}/{MAX_LOGIN_ATTEMPTS}"
+                    )
+                else:
+                    lockout_status.config(text="")
+
+            root.after(1000, update_lockout_label)
+
         def login():
+            if is_login_locked():
+                messagebox.showerror(
+                    "Locked",
+                    f"Too many failed attempts. Try again in {login_lock_remaining()} seconds."
+                )
+                return
+
             password = password_entry.get()
             twofa_code = twofa_entry.get().strip()
 
             dek = unlock_vault(password, twofa_code)
 
             if dek:
+                reset_failed_logins()
                 messagebox.showinfo("Success", "Vault unlocked.")
                 root.destroy()
                 open_main_window(dek)
             else:
-                messagebox.showerror("Error", "Wrong master password or 2FA code.")
+                record_failed_login()
 
-        tk.Button(root, text="Unlock Vault", command=login).pack(pady=20)
+                if is_login_locked():
+                    messagebox.showerror(
+                        "Locked",
+                        "Too many failed attempts. Login locked for 10 minutes."
+                    )
+                else:
+                    messagebox.showerror("Error", "Wrong master password or 2FA code.")
+
+        tk.Button(root, text="Unlock Vault", command=login).pack(pady=15)
+        tk.Button(root, text="Import Backup", command=import_encrypted_backup).pack(pady=5)
+
+        update_lockout_label()
 
     root.mainloop()
 
-
-# ---------- START ----------
 
 init_db()
 start_login_window()
