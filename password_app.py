@@ -7,6 +7,9 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 import pyotp
+import qrcode
+from PIL import ImageTk
+
 from argon2 import PasswordHasher
 from argon2.low_level import hash_secret_raw, Type
 from argon2.exceptions import VerifyMismatchError, VerificationError
@@ -106,7 +109,7 @@ def decrypt_record(dek, nonce, ciphertext):
     return json.loads(plaintext.decode())
 
 
-# ---------- MASTER PASSWORD POLICY ----------
+# ---------- PASSWORD POLICY ----------
 
 def validate_master_password(password):
     if len(password) < 12:
@@ -133,7 +136,7 @@ def vault_exists():
     return meta_get("master_hash") is not None
 
 
-def create_vault(master_password):
+def create_vault(master_password, twofa_secret):
     valid, message = validate_master_password(master_password)
 
     if not valid:
@@ -147,13 +150,20 @@ def create_vault(master_password):
 
     dek_nonce, encrypted_dek = encrypt_bytes(kek, dek)
 
+    twofa_nonce, encrypted_twofa_secret = encrypt_bytes(
+        dek,
+        twofa_secret.encode()
+    )
+
     meta_set("master_hash", master_hash.encode())
     meta_set("kdf_salt", kdf_salt)
     meta_set("dek_nonce", dek_nonce)
     meta_set("encrypted_dek", encrypted_dek)
+    meta_set("twofa_nonce", twofa_nonce)
+    meta_set("encrypted_twofa_secret", encrypted_twofa_secret)
 
 
-def unlock_vault(master_password):
+def unlock_vault(master_password, twofa_code):
     master_hash = meta_get("master_hash")
 
     if not master_hash:
@@ -171,9 +181,29 @@ def unlock_vault(master_password):
     kek = derive_key(master_password, kdf_salt)
 
     try:
-        return decrypt_bytes(kek, dek_nonce, encrypted_dek)
+        dek = decrypt_bytes(kek, dek_nonce, encrypted_dek)
     except Exception:
         return None
+
+    twofa_nonce = meta_get("twofa_nonce")
+    encrypted_twofa_secret = meta_get("encrypted_twofa_secret")
+
+    if not twofa_nonce or not encrypted_twofa_secret:
+        return None
+
+    try:
+        twofa_secret = decrypt_bytes(
+            dek,
+            twofa_nonce,
+            encrypted_twofa_secret
+        ).decode()
+    except Exception:
+        return None
+
+    if not pyotp.TOTP(twofa_secret).verify(twofa_code, valid_window=1):
+        return None
+
+    return dek
 
 
 # ---------- VAULT ENTRIES ----------
@@ -231,7 +261,7 @@ def delete_vault_entry(entry_id):
 def open_main_window(dek):
     main = tk.Tk()
     main.title("Secure Password and Authenticator Vault")
-    main.geometry("950x550")
+    main.geometry("1100x550")
 
     lock_timer = None
     decrypted_cache = {}
@@ -303,8 +333,7 @@ def open_main_window(dek):
                 code = "------"
 
                 if secret:
-                    totp = pyotp.TOTP(secret)
-                    raw_code = totp.now()
+                    raw_code = pyotp.TOTP(secret).now()
                     code = f"{raw_code[:3]} {raw_code[3:]}"
 
                 password_display = "Saved" if password else "None"
@@ -320,14 +349,16 @@ def open_main_window(dek):
                 entries.append((item_id, values))
 
             except Exception:
-                values = (
-                    "Unable to decrypt",
-                    "",
-                    "Unknown",
-                    "------",
-                    ""
-                )
-                entries.append((item_id, values))
+                entries.append((
+                    item_id,
+                    (
+                        "Unable to decrypt",
+                        "",
+                        "Unknown",
+                        "------",
+                        ""
+                    )
+                ))
 
         entries.sort(key=lambda item: str(item[1][0]).lower())
 
@@ -361,13 +392,11 @@ def open_main_window(dek):
             return
 
         data = decrypted_cache.get(item_id)
-
         if not data:
             messagebox.showerror("Error", "Username is not available.")
             return
 
         username = data.get("username", "")
-
         if not username:
             messagebox.showerror("Error", "No username saved for this entry.")
             return
@@ -384,13 +413,11 @@ def open_main_window(dek):
             return
 
         data = decrypted_cache.get(item_id)
-
         if not data:
             messagebox.showerror("Error", "Password is not available.")
             return
 
         password = data.get("password", "")
-
         if not password:
             messagebox.showerror("Error", "No password saved for this entry.")
             return
@@ -407,13 +434,11 @@ def open_main_window(dek):
             return
 
         data = decrypted_cache.get(item_id)
-
         if not data:
             messagebox.showerror("Error", "Authenticator code is not available.")
             return
 
         secret = data.get("secret", "")
-
         if not secret:
             messagebox.showerror("Error", "No authenticator secret saved for this entry.")
             return
@@ -523,15 +548,27 @@ def open_main_window(dek):
     main.mainloop()
 
 
-# ---------- LOGIN WINDOW ----------
+# ---------- LOGIN / CREATE VAULT WINDOW ----------
 
 def start_login_window():
     root = tk.Tk()
     root.title("Vault Login")
-    root.geometry("390x390")
     root.resizable(False, False)
 
     if not vault_exists():
+        root.geometry("470x820")
+
+        twofa_secret = pyotp.random_base32()
+
+        setup_uri = pyotp.TOTP(twofa_secret).provisioning_uri(
+            name="Vault Login",
+            issuer_name="Python Password Vault"
+        )
+
+        qr_image = qrcode.make(setup_uri)
+        qr_image = qr_image.resize((190, 190))
+        qr_photo = ImageTk.PhotoImage(qr_image)
+
         tk.Label(root, text="Create Master Password", font=("Arial", 14)).pack(pady=10)
 
         tk.Label(
@@ -545,7 +582,7 @@ def start_login_window():
                 "• At least one special character"
             ),
             justify="left",
-            fg="green"
+            fg="darkgreen"
         ).pack(pady=5)
 
         tk.Label(root, text="Password").pack()
@@ -556,19 +593,53 @@ def start_login_window():
         confirm_entry = tk.Entry(root, show="*", width=35)
         confirm_entry.pack(pady=5)
 
+        tk.Label(
+            root,
+            text=(
+                "Required 2FA Setup:\n"
+                "Scan this QR code with Google Authenticator,\n"
+                "Microsoft Authenticator, Authy, or another TOTP app."
+            ),
+            justify="center"
+        ).pack(pady=10)
+
+        qr_label = tk.Label(root, image=qr_photo)
+        qr_label.image = qr_photo
+        qr_label.pack(pady=5)
+
+        tk.Label(root, text="Manual setup key:").pack(pady=(10, 0))
+
+        secret_text = tk.Text(root, height=2, width=45)
+        secret_text.insert("1.0", twofa_secret)
+        secret_text.config(state="disabled")
+        secret_text.pack(pady=5)
+
+        tk.Label(root, text="Enter 6-digit 2FA code").pack()
+        twofa_entry = tk.Entry(root, width=20)
+        twofa_entry.pack(pady=5)
+
         def create():
             password = password_entry.get()
             confirm = confirm_entry.get()
+            twofa_code = twofa_entry.get().strip()
 
             if password != confirm:
                 messagebox.showerror("Error", "Passwords do not match.")
                 return
 
-            try:
-                create_vault(password)
-                dek = unlock_vault(password)
+            if not pyotp.TOTP(twofa_secret).verify(twofa_code, valid_window=1):
+                messagebox.showerror("Error", "Invalid 2FA code.")
+                return
 
-                messagebox.showinfo("Success", "Vault created.")
+            try:
+                create_vault(password, twofa_secret)
+                dek = unlock_vault(password, twofa_code)
+
+                if not dek:
+                    messagebox.showerror("Error", "Vault created, but unlock failed.")
+                    return
+
+                messagebox.showinfo("Success", "Vault created with 2FA enabled.")
                 root.destroy()
                 open_main_window(dek)
 
@@ -578,22 +649,30 @@ def start_login_window():
         tk.Button(root, text="Create Vault", command=create).pack(pady=20)
 
     else:
+        root.geometry("350x320")
+
         tk.Label(root, text="Enter Master Password", font=("Arial", 14)).pack(pady=20)
 
         tk.Label(root, text="Password").pack()
         password_entry = tk.Entry(root, show="*", width=35)
         password_entry.pack(pady=5)
 
+        tk.Label(root, text="2FA Code").pack()
+        twofa_entry = tk.Entry(root, width=20)
+        twofa_entry.pack(pady=5)
+
         def login():
             password = password_entry.get()
-            dek = unlock_vault(password)
+            twofa_code = twofa_entry.get().strip()
+
+            dek = unlock_vault(password, twofa_code)
 
             if dek:
                 messagebox.showinfo("Success", "Vault unlocked.")
                 root.destroy()
                 open_main_window(dek)
             else:
-                messagebox.showerror("Error", "Wrong master password.")
+                messagebox.showerror("Error", "Wrong master password or 2FA code.")
 
         tk.Button(root, text="Unlock Vault", command=login).pack(pady=20)
 
