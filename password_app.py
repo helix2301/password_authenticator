@@ -28,8 +28,6 @@ LOGIN_LOCKOUT_SECONDS = 10 * 60
 ph = PasswordHasher()
 
 
-# ---------- LOGO ----------
-
 def load_logo(width=100):
     if not os.path.exists(LOGO_FILE):
         return None
@@ -38,8 +36,6 @@ def load_logo(width=100):
     image.thumbnail((width, width))
     return ImageTk.PhotoImage(image)
 
-
-# ---------- DATABASE ----------
 
 def db_connect():
     return sqlite3.connect(DB_FILE)
@@ -80,12 +76,10 @@ def meta_get(key):
 def meta_set(key, value):
     conn = db_connect()
     cur = conn.cursor()
-
     cur.execute("""
         INSERT OR REPLACE INTO vault_meta (key, value)
         VALUES (?, ?)
     """, (key, value))
-
     conn.commit()
     conn.close()
 
@@ -100,8 +94,6 @@ def meta_get_text(key, default=""):
 def meta_set_text(key, value):
     meta_set(key, str(value).encode())
 
-
-# ---------- CRYPTO ----------
 
 def derive_key(master_password, salt):
     return hash_secret_raw(
@@ -137,8 +129,6 @@ def decrypt_record(dek, nonce, ciphertext):
     return json.loads(plaintext.decode())
 
 
-# ---------- PASSWORD POLICY ----------
-
 def validate_master_password(password):
     if len(password) < 12:
         return False, "Master password must be at least 12 characters long."
@@ -152,13 +142,11 @@ def validate_master_password(password):
     if not re.search(r"\d", password):
         return False, "Master password must contain at least one number."
 
-    if not re.search(r"[!@#$%^&*()_\\-+=\\[\\]{};:'\\\",.<>/?\\\\|`~]", password):
+    if not re.search(r"[^A-Za-z0-9]", password):
         return False, "Master password must contain at least one special character."
 
     return True, ""
 
-
-# ---------- LOGIN LOCKOUT ----------
 
 def get_lockout_until():
     try:
@@ -196,8 +184,6 @@ def reset_failed_logins():
     meta_set_text("failed_attempts", 0)
     meta_set_text("lockout_until", 0)
 
-
-# ---------- VAULT ----------
 
 def vault_exists():
     return meta_get("master_hash") is not None
@@ -274,8 +260,6 @@ def unlock_vault(master_password, twofa_code):
     return dek
 
 
-# ---------- VAULT ENTRIES ----------
-
 def add_vault_entry(service, username, password, secret, dek):
     data = {
         "service": service,
@@ -288,13 +272,11 @@ def add_vault_entry(service, username, password, secret, dek):
 
     conn = db_connect()
     cur = conn.cursor()
-
     cur.execute("""
         INSERT INTO vault_entries
         (nonce, ciphertext)
         VALUES (?, ?)
     """, (nonce, ciphertext))
-
     conn.commit()
     conn.close()
 
@@ -311,13 +293,11 @@ def update_vault_entry(entry_id, service, username, password, secret, dek):
 
     conn = db_connect()
     cur = conn.cursor()
-
     cur.execute("""
         UPDATE vault_entries
         SET nonce = ?, ciphertext = ?
         WHERE id = ?
     """, (nonce, ciphertext, entry_id))
-
     conn.commit()
     conn.close()
 
@@ -325,13 +305,11 @@ def update_vault_entry(entry_id, service, username, password, secret, dek):
 def get_vault_entries():
     conn = db_connect()
     cur = conn.cursor()
-
     cur.execute("""
         SELECT id, nonce, ciphertext
         FROM vault_entries
         ORDER BY id
     """)
-
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -344,8 +322,6 @@ def delete_vault_entry(entry_id):
     conn.commit()
     conn.close()
 
-
-# ---------- BACKUP ----------
 
 def derive_backup_key(backup_password, salt):
     return hash_secret_raw(
@@ -449,8 +425,6 @@ def import_encrypted_backup():
             "Could not restore backup. Wrong password or damaged backup file."
         )
 
-
-# ---------- MAIN WINDOW ----------
 
 def open_main_window(dek):
     main = tk.Tk()
@@ -810,8 +784,6 @@ def open_main_window(dek):
     main.mainloop()
 
 
-# ---------- LOGIN WINDOW ----------
-
 def start_login_window():
     root = tk.Tk()
     root.title("NxTPass Vault Login")
@@ -836,7 +808,7 @@ def start_login_window():
     root.protocol("WM_DELETE_WINDOW", close_login_window)
 
     if not vault_exists():
-        root.geometry("470x890")
+        root.geometry("470x900")
 
         twofa_secret = pyotp.random_base32()
 
@@ -925,13 +897,31 @@ def start_login_window():
             except ValueError as error:
                 messagebox.showerror("Weak Password", str(error))
 
-        tk.Button(root, text="Create Vault", command=create).pack(pady=20)
+        tk.Button(
+            root,
+            text="Create Vault",
+            width=22,
+            height=2,
+            command=create
+        ).pack(pady=(20, 10))
+
+        logo_photo = load_logo(150)
+
+        if logo_photo:
+            root.logo_photo = logo_photo
+            tk.Label(
+                root,
+                image=logo_photo,
+                borderwidth=0,
+                highlightthickness=0
+            ).pack(pady=(5, 15))
 
     else:
-        root.geometry("370x480")
+        root.geometry("370x560")
 
-        tk.Label(root,text="Enter Master Password",font=("Arial", 14, "bold")).pack(pady=(20, 10))
-        logo_photo = load_logo(150)
+        tk.Label(root, text="Enter Master Password", font=("Arial", 14, "bold")).pack(pady=(20, 10))
+
+        logo_photo = load_logo(100)
 
         if logo_photo:
             root.logo_photo = logo_photo
@@ -1015,8 +1005,6 @@ def start_login_window():
 
     root.mainloop()
 
-
-# ---------- START ----------
 
 init_db()
 start_login_window()
