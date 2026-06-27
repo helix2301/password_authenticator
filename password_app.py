@@ -8,7 +8,7 @@ from tkinter import messagebox, ttk, filedialog, simpledialog
 
 import pyotp
 import qrcode
-from PIL import ImageTk
+from PIL import Image, ImageTk
 
 from argon2 import PasswordHasher
 from argon2.low_level import hash_secret_raw, Type
@@ -17,8 +17,9 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 DB_FILE = "authenticator.db"
+LOGO_FILE = "NxTPass-Logo.png"
 
-LOCK_TIMEOUT_MS = 5 * 60 * 1000
+LOCK_TIMEOUT_MS = 15 * 60 * 1000
 CLIPBOARD_CLEAR_MS = 30 * 1000
 
 MAX_LOGIN_ATTEMPTS = 5
@@ -26,6 +27,19 @@ LOGIN_LOCKOUT_SECONDS = 10 * 60
 
 ph = PasswordHasher()
 
+
+# ---------- LOGO ----------
+
+def load_logo(width=100):
+    if not os.path.exists(LOGO_FILE):
+        return None
+
+    image = Image.open(LOGO_FILE)
+    image.thumbnail((width, width))
+    return ImageTk.PhotoImage(image)
+
+
+# ---------- DATABASE ----------
 
 def db_connect():
     return sqlite3.connect(DB_FILE)
@@ -66,10 +80,12 @@ def meta_get(key):
 def meta_set(key, value):
     conn = db_connect()
     cur = conn.cursor()
+
     cur.execute("""
         INSERT OR REPLACE INTO vault_meta (key, value)
         VALUES (?, ?)
     """, (key, value))
+
     conn.commit()
     conn.close()
 
@@ -84,6 +100,8 @@ def meta_get_text(key, default=""):
 def meta_set_text(key, value):
     meta_set(key, str(value).encode())
 
+
+# ---------- CRYPTO ----------
 
 def derive_key(master_password, salt):
     return hash_secret_raw(
@@ -119,6 +137,8 @@ def decrypt_record(dek, nonce, ciphertext):
     return json.loads(plaintext.decode())
 
 
+# ---------- PASSWORD POLICY ----------
+
 def validate_master_password(password):
     if len(password) < 12:
         return False, "Master password must be at least 12 characters long."
@@ -132,11 +152,13 @@ def validate_master_password(password):
     if not re.search(r"\d", password):
         return False, "Master password must contain at least one number."
 
-    if not re.search(r"[!@#$%^&*()_\-+=\[\]{};:'\",.<>/?\\|`~]", password):
+    if not re.search(r"[!@#$%^&*()_\\-+=\\[\\]{};:'\\\",.<>/?\\\\|`~]", password):
         return False, "Master password must contain at least one special character."
 
     return True, ""
 
+
+# ---------- LOGIN LOCKOUT ----------
 
 def get_lockout_until():
     try:
@@ -174,6 +196,8 @@ def reset_failed_logins():
     meta_set_text("failed_attempts", 0)
     meta_set_text("lockout_until", 0)
 
+
+# ---------- VAULT ----------
 
 def vault_exists():
     return meta_get("master_hash") is not None
@@ -250,6 +274,8 @@ def unlock_vault(master_password, twofa_code):
     return dek
 
 
+# ---------- VAULT ENTRIES ----------
+
 def add_vault_entry(service, username, password, secret, dek):
     data = {
         "service": service,
@@ -318,6 +344,8 @@ def delete_vault_entry(entry_id):
     conn.commit()
     conn.close()
 
+
+# ---------- BACKUP ----------
 
 def derive_backup_key(backup_password, salt):
     return hash_secret_raw(
@@ -422,32 +450,60 @@ def import_encrypted_backup():
         )
 
 
+# ---------- MAIN WINDOW ----------
+
 def open_main_window(dek):
     main = tk.Tk()
-    main.title("Secure Password and Authenticator Vault")
-    main.geometry("1050x630")
+    main.title("NxTPass Secure Password and Authenticator Vault")
+    main.geometry("1050x660")
 
     lock_timer = None
     clipboard_timer = None
+    refresh_timer = None
     decrypted_cache = {}
+
+    logo_photo = load_logo(80)
+
+    if logo_photo:
+        main.logo_photo = logo_photo
+        tk.Label(main, image=logo_photo).pack(pady=5)
+
+    def cleanup_and_close():
+        nonlocal lock_timer, clipboard_timer, refresh_timer
+
+        decrypted_cache.clear()
+
+        for timer in (lock_timer, clipboard_timer, refresh_timer):
+            if timer is not None:
+                try:
+                    main.after_cancel(timer)
+                except tk.TclError:
+                    pass
+
+        main.destroy()
 
     def lock_app():
         messagebox.showinfo("Locked", "Vault locked due to inactivity.")
-        decrypted_cache.clear()
-        main.destroy()
+        cleanup_and_close()
 
     def reset_lock_timer(event=None):
         nonlocal lock_timer
 
         if lock_timer:
-            main.after_cancel(lock_timer)
+            try:
+                main.after_cancel(lock_timer)
+            except tk.TclError:
+                pass
 
         lock_timer = main.after(LOCK_TIMEOUT_MS, lock_app)
 
     def clear_clipboard():
-        main.clipboard_clear()
-        main.update()
-        status_label.config(text="Clipboard cleared.")
+        try:
+            main.clipboard_clear()
+            main.update()
+            status_label.config(text="Clipboard cleared.")
+        except tk.TclError:
+            pass
 
     def copy_to_clipboard(value, message):
         nonlocal clipboard_timer
@@ -457,19 +513,23 @@ def open_main_window(dek):
         main.update()
 
         if clipboard_timer:
-            main.after_cancel(clipboard_timer)
+            try:
+                main.after_cancel(clipboard_timer)
+            except tk.TclError:
+                pass
 
         clipboard_timer = main.after(CLIPBOARD_CLEAR_MS, clear_clipboard)
         status_label.config(text=message + " Clipboard will clear in 30 seconds.")
 
+    main.protocol("WM_DELETE_WINDOW", cleanup_and_close)
     main.bind_all("<Key>", reset_lock_timer)
     main.bind_all("<Button>", reset_lock_timer)
 
     tk.Label(
         main,
-        text="Secure Password and Authenticator Vault",
+        text="NxTPass Secure Password and Authenticator Vault",
         font=("Arial", 18)
-    ).pack(pady=15)
+    ).pack(pady=10)
 
     tree = ttk.Treeview(
         main,
@@ -496,70 +556,75 @@ def open_main_window(dek):
     status_label.pack(fill="x", padx=10, pady=5)
 
     def refresh_codes():
-        remaining = 30 - (int(time.time()) % 30)
-        current_ids = set()
-        entries = []
+        nonlocal refresh_timer
 
-        for entry_id, nonce, ciphertext in get_vault_entries():
-            item_id = str(entry_id)
-            current_ids.add(item_id)
+        try:
+            remaining = 30 - (int(time.time()) % 30)
+            current_ids = set()
+            entries = []
 
-            try:
-                data = decrypt_record(dek, nonce, ciphertext)
-                decrypted_cache[item_id] = data
+            for entry_id, nonce, ciphertext in get_vault_entries():
+                item_id = str(entry_id)
+                current_ids.add(item_id)
 
-                service = data.get("service", "")
-                username = data.get("username", "")
-                password = data.get("password", "")
-                secret = data.get("secret", "")
+                try:
+                    data = decrypt_record(dek, nonce, ciphertext)
+                    decrypted_cache[item_id] = data
 
-                code = "------"
+                    service = data.get("service", "")
+                    username = data.get("username", "")
+                    password = data.get("password", "")
+                    secret = data.get("secret", "")
 
-                if secret:
-                    raw_code = pyotp.TOTP(secret).now()
-                    code = f"{raw_code[:3]} {raw_code[3:]}"
+                    code = "------"
 
-                password_display = "Saved" if password else "None"
+                    if secret:
+                        raw_code = pyotp.TOTP(secret).now()
+                        code = f"{raw_code[:3]} {raw_code[3:]}"
 
-                entries.append((
-                    item_id,
-                    (
-                        service,
-                        username,
-                        password_display,
-                        code,
-                        f"{remaining}s"
-                    )
-                ))
+                    password_display = "Saved" if password else "None"
 
-            except Exception:
-                entries.append((
-                    item_id,
-                    (
-                        "Unable to decrypt",
-                        "",
-                        "Unknown",
-                        "------",
-                        ""
-                    )
-                ))
+                    entries.append((
+                        item_id,
+                        (
+                            service,
+                            username,
+                            password_display,
+                            code,
+                            f"{remaining}s"
+                        )
+                    ))
 
-        entries.sort(key=lambda item: str(item[1][0]).lower())
+                except Exception:
+                    entries.append((
+                        item_id,
+                        (
+                            "Unable to decrypt",
+                            "",
+                            "Unknown",
+                            "------",
+                            ""
+                        )
+                    ))
 
-        existing_ids = set(tree.get_children())
+            entries.sort(key=lambda item: str(item[1][0]).lower())
+            existing_ids = set(tree.get_children())
 
-        for item_id, values in entries:
-            if tree.exists(item_id):
-                tree.item(item_id, values=values)
-            else:
-                tree.insert("", "end", iid=item_id, values=values)
+            for item_id, values in entries:
+                if tree.exists(item_id):
+                    tree.item(item_id, values=values)
+                else:
+                    tree.insert("", "end", iid=item_id, values=values)
 
-        for item_id in existing_ids:
-            if item_id not in current_ids:
-                tree.delete(item_id)
-                decrypted_cache.pop(item_id, None)
+            for item_id in existing_ids:
+                if item_id not in current_ids:
+                    tree.delete(item_id)
+                    decrypted_cache.pop(item_id, None)
 
-        main.after(1000, refresh_codes)
+            refresh_timer = main.after(1000, refresh_codes)
+
+        except tk.TclError:
+            return
 
     def get_selected_item():
         selected = tree.selection()
@@ -729,96 +794,62 @@ def open_main_window(dek):
     button_frame = tk.Frame(main)
     button_frame.pack(pady=10)
 
-    # Row 1: copy and lock buttons
-    tk.Button(
-        button_frame,
-        text="Copy Username",
-        width=16,
-        command=copy_selected_username
-    ).grid(row=0, column=0, padx=5, pady=5)
+    tk.Button(button_frame, text="Copy Username", width=16, command=copy_selected_username).grid(row=0, column=0, padx=5, pady=5)
+    tk.Button(button_frame, text="Copy Password", width=16, command=copy_selected_password).grid(row=0, column=1, padx=5, pady=5)
+    tk.Button(button_frame, text="Copy Code", width=16, command=copy_selected_code).grid(row=0, column=2, padx=5, pady=5)
+    tk.Button(button_frame, text="Lock Vault", width=16, command=cleanup_and_close).grid(row=0, column=3, padx=5, pady=5)
 
-    tk.Button(
-        button_frame,
-        text="Copy Password",
-        width=16,
-        command=copy_selected_password
-    ).grid(row=0, column=1, padx=5, pady=5)
-
-    tk.Button(
-        button_frame,
-        text="Copy Code",
-        width=16,
-        command=copy_selected_code
-    ).grid(row=0, column=2, padx=5, pady=5)
-
-    tk.Button(
-        button_frame,
-        text="Lock Vault",
-        width=16,
-        command=main.destroy
-    ).grid(row=0, column=3, padx=5, pady=5)
-
-    # Row 2: management and backup buttons
-    tk.Button(
-        button_frame,
-        text="Add",
-        width=16,
-        command=lambda: entry_window("add")
-    ).grid(row=1, column=0, padx=5, pady=5)
-
-    tk.Button(
-        button_frame,
-        text="Edit",
-        width=16,
-        command=lambda: entry_window("edit")
-    ).grid(row=1, column=1, padx=5, pady=5)
-
-    tk.Button(
-        button_frame,
-        text="Delete",
-        width=16,
-        command=delete_selected
-    ).grid(row=1, column=2, padx=5, pady=5)
-
-    tk.Button(
-        button_frame,
-        text="Backup Vault",
-        width=16,
-        command=export_encrypted_backup
-    ).grid(row=1, column=3, padx=5, pady=5)
-
-    tk.Button(
-        button_frame,
-        text="Restore Vault",
-        width=16,
-        command=import_encrypted_backup
-    ).grid(row=1, column=4, padx=5, pady=5)
+    tk.Button(button_frame, text="Add", width=16, command=lambda: entry_window("add")).grid(row=1, column=0, padx=5, pady=5)
+    tk.Button(button_frame, text="Edit", width=16, command=lambda: entry_window("edit")).grid(row=1, column=1, padx=5, pady=5)
+    tk.Button(button_frame, text="Delete", width=16, command=delete_selected).grid(row=1, column=2, padx=5, pady=5)
+    tk.Button(button_frame, text="Backup Vault", width=16, command=export_encrypted_backup).grid(row=1, column=3, padx=5, pady=5)
+    tk.Button(button_frame, text="Restore Vault", width=16, command=import_encrypted_backup).grid(row=1, column=4, padx=5, pady=5)
 
     refresh_codes()
     reset_lock_timer()
     main.mainloop()
 
 
+# ---------- LOGIN WINDOW ----------
+
 def start_login_window():
     root = tk.Tk()
-    root.title("Vault Login")
+    root.title("NxTPass Vault Login")
     root.resizable(False, False)
 
+    login_window_active = True
+    lockout_timer = None
+
+    def close_login_window():
+        nonlocal login_window_active, lockout_timer
+
+        login_window_active = False
+
+        if lockout_timer is not None:
+            try:
+                root.after_cancel(lockout_timer)
+            except tk.TclError:
+                pass
+
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", close_login_window)
+
     if not vault_exists():
-        root.geometry("470x820")
+        root.geometry("470x890")
 
         twofa_secret = pyotp.random_base32()
 
         setup_uri = pyotp.TOTP(twofa_secret).provisioning_uri(
-            name="Vault Login",
-            issuer_name="Python Password Vault"
+            name="NxTPass Vault Login",
+            issuer_name="NxTPass Password Vault"
         )
 
         qr_image = qrcode.make(setup_uri)
         qr_image = qr_image.resize((190, 190))
         qr_photo = ImageTk.PhotoImage(qr_image)
 
-        tk.Label(root, text="Create Master Password", font=("Arial", 14)).pack(pady=10)
+        tk.Label(root, text="Create NxTPass Master Vault", font=("Arial", 14)).pack(pady=10)
 
         tk.Label(
             root,
@@ -888,7 +919,7 @@ def start_login_window():
                     return
 
                 messagebox.showinfo("Success", "Vault created with 2FA enabled.")
-                root.destroy()
+                close_login_window()
                 open_main_window(dek)
 
             except ValueError as error:
@@ -897,9 +928,14 @@ def start_login_window():
         tk.Button(root, text="Create Vault", command=create).pack(pady=20)
 
     else:
-        root.geometry("370x390")
+        root.geometry("370x480")
 
-        tk.Label(root, text="Enter Master Password", font=("Arial", 14)).pack(pady=20)
+        tk.Label(root,text="Enter Master Password",font=("Arial", 14, "bold")).pack(pady=(20, 10))
+        logo_photo = load_logo(150)
+
+        if logo_photo:
+            root.logo_photo = logo_photo
+            tk.Label(root, image=logo_photo, borderwidth=0).pack(pady=(0, 15))
 
         lockout_status = tk.Label(root, text="", fg="red")
         lockout_status.pack(pady=5)
@@ -913,23 +949,35 @@ def start_login_window():
         twofa_entry.pack(pady=5)
 
         def update_lockout_label():
-            if is_login_locked():
-                seconds = login_lock_remaining()
-                minutes = seconds // 60
-                remainder = seconds % 60
-                lockout_status.config(
-                    text=f"Locked. Try again in {minutes}:{remainder:02d}"
-                )
-            else:
-                attempts = get_failed_attempts()
-                if attempts:
+            nonlocal lockout_timer, login_window_active
+
+            if not login_window_active:
+                return
+
+            try:
+                if not root.winfo_exists():
+                    return
+
+                if is_login_locked():
+                    seconds = login_lock_remaining()
+                    minutes = seconds // 60
+                    remainder = seconds % 60
                     lockout_status.config(
-                        text=f"Failed attempts: {attempts}/{MAX_LOGIN_ATTEMPTS}"
+                        text=f"Locked. Try again in {minutes}:{remainder:02d}"
                     )
                 else:
-                    lockout_status.config(text="")
+                    attempts = get_failed_attempts()
+                    if attempts:
+                        lockout_status.config(
+                            text=f"Failed attempts: {attempts}/{MAX_LOGIN_ATTEMPTS}"
+                        )
+                    else:
+                        lockout_status.config(text="")
 
-            root.after(1000, update_lockout_label)
+                lockout_timer = root.after(1000, update_lockout_label)
+
+            except tk.TclError:
+                return
 
         def login():
             if is_login_locked():
@@ -947,7 +995,7 @@ def start_login_window():
             if dek:
                 reset_failed_logins()
                 messagebox.showinfo("Success", "Vault unlocked.")
-                root.destroy()
+                close_login_window()
                 open_main_window(dek)
             else:
                 record_failed_login()
@@ -967,6 +1015,8 @@ def start_login_window():
 
     root.mainloop()
 
+
+# ---------- START ----------
 
 init_db()
 start_login_window()
