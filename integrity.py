@@ -91,12 +91,9 @@ def verify_vault_fingerprint():
 
 def run_database_repair_check():
     required = [
-        "master_hash",
         "kdf_salt",
         "dek_nonce",
         "encrypted_dek",
-        "twofa_nonce",
-        "encrypted_twofa_secret",
         VAULT_UUID_KEY,
         VAULT_CREATED_AT_KEY,
         VAULT_VERSION_KEY,
@@ -109,6 +106,24 @@ def run_database_repair_check():
 
     if missing:
         return False, "Missing vault metadata: " + ", ".join(missing)
+
+    has_external_2fa = meta_get("twofa_external_enabled") == b"1"
+    has_legacy_2fa = (
+        meta_get("twofa_nonce") is not None
+        and meta_get("encrypted_twofa_secret") is not None
+    )
+
+    if not has_external_2fa and not has_legacy_2fa:
+        return False, "Missing vault-login 2FA metadata."
+
+    has_v9_verifier = (
+        meta_get("protected_verifier_nonce") is not None
+        and meta_get("protected_verifier") is not None
+    )
+    has_legacy_hash = meta_get("master_hash") is not None
+
+    if not has_v9_verifier and not has_legacy_hash:
+        return False, "Missing password verifier metadata."
 
     return True, ""
 

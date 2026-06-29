@@ -1,8 +1,83 @@
 import sqlite3
+import json
+import hashlib
 from config import DB_FILE
 
+SENSITIVE_META_KEYS = {
+    "vault_uuid",
+    "vault_created_at",
+    "vault_fingerprint",
+}
+
+
+def _derive_meta_privacy_key():
+    from device_secret import load_or_create_device_secret
+    return hashlib.sha256(
+        load_or_create_device_secret() + b"NxTPass metadata privacy v1"
+    ).digest()
+
+
+def _protect_meta_value(key, value):
+    if key not in SENSITIVE_META_KEYS:
+        return value
+
+    from crypto_utils import encrypt_bytes
+
+    if isinstance(value, str):
+        raw = value.encode()
+    else:
+        raw = value
+
+    nonce, ciphertext = encrypt_bytes(
+        _derive_meta_privacy_key(),
+        raw,
+        aad=f"NxTPass:meta:{key}".encode()
+    )
+
+    payload = {
+        "protected": True,
+        "version": 1,
+        "nonce": nonce.hex(),
+        "ciphertext": ciphertext.hex()
+    }
+
+    return json.dumps(payload, sort_keys=True).encode()
+
+
+def _unprotect_meta_value(key, value):
+    if key not in SENSITIVE_META_KEYS:
+        return value
+
+    if value is None:
+        return None
+
+    try:
+        parsed = json.loads(value.decode())
+        if not parsed.get("protected"):
+            return value
+
+        from crypto_utils import decrypt_bytes
+
+        plaintext = decrypt_bytes(
+            _derive_meta_privacy_key(),
+            bytes.fromhex(parsed["nonce"]),
+            bytes.fromhex(parsed["ciphertext"]),
+            aad=f"NxTPass:meta:{key}".encode()
+        )
+
+        return plaintext
+
+    except Exception:
+        # Legacy plaintext compatibility.
+        return value
+
+
 def db_connect():
-    return sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = FULL")
+    return conn
 
 def init_db():
     conn = db_connect()
@@ -76,9 +151,11 @@ def meta_get(key):
     cur.execute("SELECT value FROM vault_meta WHERE key = ?", (key,))
     row = cur.fetchone()
     conn.close()
-    return row[0] if row else None
+    return _unprotect_meta_value(key, row[0]) if row else None
 
 def meta_set(key, value):
+    value = _protect_meta_value(key, value)
+
     conn = db_connect()
     cur = conn.cursor()
     cur.execute("INSERT OR REPLACE INTO vault_meta (key, value) VALUES (?, ?)", (key, value))

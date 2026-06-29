@@ -21,7 +21,7 @@ VAULT_COUNTER_KEY = "vault_counter"
 
 # Session and hardening
 SESSION_CHECK_MS = 60 * 1000
-INTEGRITY_CHECK_MS = 2 * 60 * 1000
+INTEGRITY_CHECK_MS = 15 * 1000
 MAX_TAMPER_EVENTS = 3
 TAMPER_COUNTER_FILE = ".nxtpass_tamper_counter"
 EMERGENCY_WIPE_MODE = "quarantine"  # quarantine is safer than permanent delete

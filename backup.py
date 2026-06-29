@@ -3,12 +3,19 @@ import json
 import shutil
 import sqlite3
 import tempfile
+import secrets
+import platform
+import hashlib
+from pathlib import Path
 from datetime import datetime, timezone
 from tkinter import messagebox, filedialog, simpledialog
 
 from config import DB_FILE, APP_NAME, BACKUP_VERSION
 from crypto_utils import derive_backup_key, encrypt_bytes, decrypt_bytes
 from security import validate_master_password
+from device_secret import load_or_create_device_secret
+from database import meta_get_text
+from rollback import read_signed_state, verify_signed_state
 
 
 REQUIRED_TABLES = {
@@ -21,12 +28,9 @@ REQUIRED_TABLES = {
 
 
 REQUIRED_META_KEYS = {
-    "master_hash",
     "kdf_salt",
     "dek_nonce",
     "encrypted_dek",
-    "twofa_nonce",
-    "encrypted_twofa_secret",
     "vault_uuid",
     "vault_created_at",
     "vault_version",
@@ -34,6 +38,209 @@ REQUIRED_META_KEYS = {
     "vault_counter",
     "integrity_hmac",
 }
+
+
+
+def read_meta_from_sqlite(db_path):
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT key, value FROM vault_meta")
+    rows = dict(cur.fetchall())
+    conn.close()
+    return rows
+
+
+def decode_meta_value(value):
+    if value is None:
+        return ""
+    try:
+        return value.decode()
+    except Exception:
+        return ""
+
+
+def get_current_vault_identity():
+    """
+    Return the current active vault identity from the live database and signed rollback state.
+    If no current vault exists, returns None.
+    """
+    if not os.path.exists(DB_FILE):
+        return None
+
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM vault_meta WHERE key='vault_uuid'")
+        uuid_row = cur.fetchone()
+        cur.execute("SELECT value FROM vault_meta WHERE key='vault_counter'")
+        counter_row = cur.fetchone()
+        conn.close()
+
+        if not uuid_row or not counter_row:
+            return None
+
+        current_uuid = decode_meta_value(uuid_row[0])
+        current_counter = int(decode_meta_value(counter_row[0]))
+
+        state = read_signed_state()
+        state_ok, state_message = verify_signed_state(state)
+
+        if not state_ok:
+            raise ValueError(
+                "Current trusted rollback state is invalid. "
+                "Restore is blocked to avoid replacing the vault from an untrusted state. "
+                + state_message
+            )
+
+        return {
+            "vault_uuid": current_uuid,
+            "vault_counter": current_counter,
+            "signed_counter": int(state.get("counter", -1)),
+            "signed_uuid": state.get("vault_uuid", "")
+        }
+
+    except Exception as error:
+        raise ValueError(f"Could not verify current vault identity before restore: {error}")
+
+
+def verify_restore_is_authorized(temp_db_path):
+    """
+    Prevent backup-interface database replacement attacks.
+
+    If an active vault exists, the restored database must:
+    - have the same vault_uuid as the current vault
+    - have a counter equal to or newer than the signed trusted rollback state
+    - not belong to a different vault
+
+    First-time restore with no current database is allowed.
+    """
+
+    current = get_current_vault_identity()
+
+    if current is None:
+        return True
+
+    restored_meta = read_meta_from_sqlite(temp_db_path)
+
+    restored_uuid = decode_meta_value(restored_meta.get("vault_uuid"))
+    restored_counter_text = decode_meta_value(restored_meta.get("vault_counter"))
+
+    if not restored_uuid:
+        raise ValueError("Restored database does not contain a readable vault UUID.")
+
+    try:
+        restored_counter = int(restored_counter_text)
+    except Exception:
+        raise ValueError("Restored database contains an invalid vault counter.")
+
+    if current["signed_uuid"] != current["vault_uuid"]:
+        raise ValueError("Current signed rollback state does not match the active vault UUID.")
+
+    if restored_uuid != current["vault_uuid"]:
+        raise ValueError(
+            "Restore blocked. Backup belongs to a different vault UUID than the current vault."
+        )
+
+    if restored_counter < current["signed_counter"]:
+        raise ValueError(
+            "Restore blocked. Backup is older than the trusted current rollback state."
+        )
+
+    if restored_counter > current["signed_counter"]:
+        raise ValueError(
+            "Restore blocked. Backup counter is newer than the trusted current rollback state. "
+            "NxTPass will not trust a backup-provided counter automatically."
+        )
+
+    return True
+
+
+
+APP_DIR_NAME = "NxTPass"
+RECOVERY_DIR_NAME = "recovery"
+
+
+def get_app_support_dir():
+    system = platform.system()
+
+    if system == "Darwin":
+        base = Path.home() / "Library" / "Application Support" / APP_DIR_NAME
+    elif system == "Windows":
+        base = Path(os.environ.get("APPDATA", str(Path.home()))) / APP_DIR_NAME
+    else:
+        base = Path.home() / ".config" / APP_DIR_NAME
+
+    base.mkdir(parents=True, exist_ok=True)
+
+    try:
+        os.chmod(base, 0o700)
+    except Exception:
+        pass
+
+    return base
+
+
+def get_recovery_dir():
+    recovery_dir = get_app_support_dir() / RECOVERY_DIR_NAME
+    recovery_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        os.chmod(recovery_dir, 0o700)
+    except Exception:
+        pass
+
+    return recovery_dir
+
+
+def derive_local_recovery_key():
+    return hashlib.sha256(
+        load_or_create_device_secret() + b"NxTPass encrypted local recovery copy v1"
+    ).digest()
+
+
+def create_encrypted_pre_restore_copy():
+    """
+    Create an encrypted local safety copy before restore.
+
+    v20 change:
+    - No raw authenticator.db.pre_restore*.bak copy is left beside the live DB.
+    - The safety copy is encrypted using the local device secret.
+    - Filename is random, not predictable.
+    """
+
+    if not os.path.exists(DB_FILE):
+        return None
+
+    with open(DB_FILE, "rb") as f:
+        db_bytes = f.read()
+
+    key = derive_local_recovery_key()
+    nonce, ciphertext = encrypt_bytes(
+        key,
+        db_bytes,
+        aad=b"NxTPass pre-restore recovery copy v1"
+    )
+
+    recovery_data = {
+        "app": APP_NAME,
+        "type": "encrypted_pre_restore_recovery",
+        "version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "nonce": nonce.hex(),
+        "ciphertext": ciphertext.hex()
+    }
+
+    random_name = f"recovery_{secrets.token_hex(16)}.nxtrecovery"
+    recovery_path = get_recovery_dir() / random_name
+
+    recovery_path.write_text(json.dumps(recovery_data, indent=2))
+
+    try:
+        os.chmod(recovery_path, 0o600)
+    except Exception:
+        pass
+
+    return str(recovery_path)
 
 
 def export_encrypted_backup():
@@ -114,16 +321,6 @@ def decrypt_backup_file(file_path, backup_password):
 
 
 def validate_restored_database_file(temp_db_path):
-    """
-    Validate backup before replacing the real database.
-
-    This checks:
-    - SQLite can open the database
-    - PRAGMA integrity_check passes
-    - Required tables exist
-    - Required vault metadata keys exist
-    """
-
     conn = sqlite3.connect(temp_db_path)
     cur = conn.cursor()
 
@@ -162,18 +359,28 @@ def validate_restored_database_file(temp_db_path):
             + ", ".join(sorted(missing_meta))
         )
 
+    has_v9_verifier = (
+        "protected_verifier_nonce" in found_meta
+        and "protected_verifier" in found_meta
+    )
+    has_legacy_hash = "master_hash" in found_meta
+
+    if not has_v9_verifier and not has_legacy_hash:
+        conn.close()
+        raise ValueError("Restored database is missing password verifier metadata.")
+
+    has_external_2fa = "twofa_external_enabled" in found_meta
+    has_legacy_2fa = (
+        "twofa_nonce" in found_meta
+        and "encrypted_twofa_secret" in found_meta
+    )
+
+    if not has_external_2fa and not has_legacy_2fa:
+        conn.close()
+        raise ValueError("Restored database is missing vault-login 2FA metadata.")
+
     conn.close()
     return True
-
-
-def make_pre_restore_safety_copy():
-    if not os.path.exists(DB_FILE):
-        return None
-
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    safety_copy = f"{DB_FILE}.pre_restore_{timestamp}.bak"
-    shutil.copy2(DB_FILE, safety_copy)
-    return safety_copy
 
 
 def import_encrypted_backup():
@@ -181,8 +388,8 @@ def import_encrypted_backup():
         "Restore Backup",
         (
             "Restoring a backup will replace the current vault database.\n\n"
-            "NxTPass will verify the backup first and create a safety copy "
-            "of your current database before replacing it.\n\n"
+            "NxTPass will verify the backup first and create an encrypted local "
+            "recovery copy of your current database before replacing it.\n\n"
             "Continue?"
         )
     )
@@ -219,15 +426,17 @@ def import_encrypted_backup():
             f.write(db_bytes)
 
         validate_restored_database_file(temp_db_path)
+        verify_restore_is_authorized(temp_db_path)
 
-        safety_copy = make_pre_restore_safety_copy()
+        recovery_copy = create_encrypted_pre_restore_copy()
 
         shutil.copy2(temp_db_path, DB_FILE)
 
-        if safety_copy:
+        if recovery_copy:
             message = (
                 "Backup restored successfully.\n\n"
-                f"A safety copy of your previous database was saved as:\n{safety_copy}\n\n"
+                "An encrypted local recovery copy of your previous database was saved as:\n"
+                f"{recovery_copy}\n\n"
                 "Restart the app before unlocking."
             )
         else:
@@ -247,7 +456,7 @@ def import_encrypted_backup():
                 "• Wrong backup password\n"
                 "• Corrupted backup file\n"
                 "• Invalid SQLite database\n"
-                "• Missing vault tables or metadata\n\n"
+                "• Missing vault tables or metadata\n• Backup does not match the currently authorized vault state\n• Backup is older/newer than the trusted rollback state\n\n"
                 f"Details: {error}"
             )
         )

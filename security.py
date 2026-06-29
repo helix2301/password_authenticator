@@ -1,7 +1,16 @@
 import re
-import time
-from config import MAX_LOGIN_ATTEMPTS, LOGIN_LOCKOUT_SECONDS
-from database import meta_get, meta_get_text, meta_set_text
+from database import meta_get
+from lockout_state import (
+    get_lockout_until,
+    get_failed_attempts,
+    is_login_locked,
+    login_lock_remaining,
+    record_failed_login,
+    reset_failed_logins,
+    initialize_lockout_state,
+    get_lockout_state_error,
+)
+
 
 def validate_master_password(password):
     if len(password) < 12:
@@ -16,35 +25,6 @@ def validate_master_password(password):
         return False, "Password must contain at least one special character."
     return True, ""
 
+
 def vault_exists():
-    return meta_get("master_hash") is not None
-
-def get_lockout_until():
-    try:
-        return int(meta_get_text("lockout_until", "0"))
-    except ValueError:
-        return 0
-
-def get_failed_attempts():
-    try:
-        return int(meta_get_text("failed_attempts", "0"))
-    except ValueError:
-        return 0
-
-def is_login_locked():
-    return int(time.time()) < get_lockout_until()
-
-def login_lock_remaining():
-    return max(0, get_lockout_until() - int(time.time()))
-
-def record_failed_login():
-    attempts = get_failed_attempts() + 1
-    if attempts >= MAX_LOGIN_ATTEMPTS:
-        meta_set_text("failed_attempts", 0)
-        meta_set_text("lockout_until", int(time.time()) + LOGIN_LOCKOUT_SECONDS)
-    else:
-        meta_set_text("failed_attempts", attempts)
-
-def reset_failed_logins():
-    meta_set_text("failed_attempts", 0)
-    meta_set_text("lockout_until", 0)
+    return meta_get("protected_verifier_nonce") is not None or meta_get("master_hash") is not None
