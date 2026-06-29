@@ -21,7 +21,7 @@ from integrity import (
 )
 from audit import add_audit_event, verify_audit_chain
 from rollback import set_vault_counter, increment_vault_counter, verify_rollback_counter, initialize_trusted_rollback_state
-from tamper import record_tamper_event, reset_tamper_count, should_emergency_wipe, emergency_protect_database
+from tamper import handle_confirmed_tamper
 from external_2fa import save_external_twofa_secret, load_external_twofa_secret
 
 ph = PasswordHasher()
@@ -288,28 +288,12 @@ def unlock_vault(master_password, twofa_code):
 
     for ok, msg, title in checks:
         if not ok:
-            count = record_tamper_event()
-
-            if should_emergency_wipe():
-                protected_path = emergency_protect_database()
-                messagebox.showerror(
-                    "Emergency Protection Triggered",
-                    (
-                        f"{title}: {msg}\n\n"
-                        f"Repeated tamper detections: {count}\n"
-                        "The suspicious database has been quarantined or removed.\n\n"
-                        f"Result: {protected_path}"
-                    )
-                )
-            else:
-                messagebox.showerror(
-                    title,
-                    f"{msg}\n\nTamper warning count: {count}"
-                )
-
+            alert_title, alert_message = handle_confirmed_tamper(
+                f"{title}: {msg}",
+                title="Tamper Detected"
+            )
+            messagebox.showerror(alert_title, alert_message)
             return None
-
-    reset_tamper_count()
 
     try:
         if meta_get("twofa_external_enabled") == b"1":

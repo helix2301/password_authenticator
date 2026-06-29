@@ -10,7 +10,7 @@ from backup import export_encrypted_backup, import_encrypted_backup
 from integrity import get_vault_fingerprint, verify_database_hmac, verify_vault_fingerprint, automatic_integrity_check, database_self_repair_best_effort
 from audit import verify_audit_chain
 from rollback import verify_rollback_counter
-from tamper import record_tamper_event, reset_tamper_count, should_emergency_wipe, emergency_protect_database
+from tamper import handle_confirmed_tamper
 from secure_runtime import secure_window_shutdown, clear_clipboard_securely, force_garbage_collection
 
 def open_main_window(session):
@@ -363,21 +363,13 @@ def open_main_window(session):
             ok, msg = automatic_integrity_check(dek())
 
             if not ok:
-                count = record_tamper_event()
-
-                if should_emergency_wipe():
-                    protected_path = emergency_protect_database()
-                    messagebox.showerror(
-                        "Emergency Protection Triggered",
-                        (
-                            f"{msg}\n\n"
-                            f"Repeated tamper detections: {count}\n"
-                            "The suspicious database has been quarantined or removed.\n\n"
-                            f"Result: {protected_path}"
-                        )
-                    )
-                    cleanup_and_close()
-                    return
+                alert_title, alert_message = handle_confirmed_tamper(
+                    msg,
+                    title="Automatic Integrity Check Failed"
+                )
+                messagebox.showerror(alert_title, alert_message)
+                cleanup_and_close()
+                return
 
                 messagebox.showerror(
                     "Automatic Integrity Check Failed",
@@ -386,7 +378,6 @@ def open_main_window(session):
                 cleanup_and_close()
                 return
 
-            reset_tamper_count()
             main.after(INTEGRITY_CHECK_MS, periodic_integrity_check)
 
         except tk.TclError:

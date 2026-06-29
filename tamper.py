@@ -1,44 +1,14 @@
 import os
 import shutil
 from datetime import datetime, timezone
-from config import DB_FILE, TAMPER_COUNTER_FILE, MAX_TAMPER_EVENTS, EMERGENCY_WIPE_MODE
-
-
-def read_tamper_count():
-    try:
-        if not os.path.exists(TAMPER_COUNTER_FILE):
-            return 0
-        with open(TAMPER_COUNTER_FILE, "r") as f:
-            return int(f.read().strip())
-    except Exception:
-        return 0
-
-
-def write_tamper_count(count):
-    try:
-        with open(TAMPER_COUNTER_FILE, "w") as f:
-            f.write(str(count))
-    except Exception:
-        pass
-
-
-def reset_tamper_count():
-    write_tamper_count(0)
-
-
-def record_tamper_event():
-    count = read_tamper_count() + 1
-    write_tamper_count(count)
-    return count
+from config import DB_FILE, EMERGENCY_WIPE_MODE
 
 
 def emergency_protect_database():
     """
-    Emergency protection after repeated tamper detections.
+    Immediate fail-closed tamper response.
 
-    Default mode is quarantine, not permanent delete. This protects the user
-    from accidental data loss while still preventing normal app use of the
-    suspicious database.
+    Default mode is quarantine, not permanent delete.
     """
     if not os.path.exists(DB_FILE):
         return None
@@ -54,5 +24,37 @@ def emergency_protect_database():
     return quarantine_name
 
 
+def handle_confirmed_tamper(reason, title="Tamper Detected"):
+    protected_path = emergency_protect_database()
+
+    return (
+        title,
+        (
+            f"{reason}\n\n"
+            "NxTPass has failed closed immediately.\n"
+            "The suspicious database has been quarantined or removed.\n\n"
+            f"Result: {protected_path}\n\n"
+            "Restore from a verified backup."
+        )
+    )
+
+
+# Backward-compatible stubs for older imports.
+def read_tamper_count():
+    return 0
+
+
+def write_tamper_count(count):
+    return None
+
+
+def reset_tamper_count():
+    return None
+
+
+def record_tamper_event():
+    return 1
+
+
 def should_emergency_wipe():
-    return read_tamper_count() >= MAX_TAMPER_EVENTS
+    return True
